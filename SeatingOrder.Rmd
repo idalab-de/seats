@@ -1,0 +1,69 @@
+---
+title: "How to optimally assign seats in the new idalab office"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(googlesheets)
+library(dplyr)
+library(ggplot2)
+```
+
+### Get the data from the preference sheet
+
+```{r warning=FALSE, results='hide', message=FALSE}
+gs_auth()
+
+#you will need to add your own auth_token here
+auth_token = 'auth_token'
+prefs = gs_key(auth_token) %>% gs_read(ws='Preferences') %>% mutate_all(funs(as.numeric)) %>% filter(!is.na(Seat)) %>% select(-Seat)
+```
+
+
+```{r}
+prefs
+```
+```{r}
+
+prefs = prefs / colSums(prefs, na.rm = T) %>% rep(nrow(prefs)) %>% matrix(byrow=T, nrow=nrow(prefs))
+
+```
+
+### Get the solver
+
+```{r message=FALSE}
+library(ROI)
+library(ROI.plugin.glpk)
+library(ompr)
+library(ompr.roi)
+```
+
+### Normalize prefs, apply multifier for FTE, and solve the seating problem!
+
+```{r}
+peeps <- ncol(prefs)
+seats = nrow(prefs)
+weights = prefs %>% as.matrix() %>% unname
+
+normalizer = matrix(rep(colSums(weights, na.rm = T), seats), byrow = T, ncol = peeps)
+
+# give higher weights to full-time employees, you need to adapt the names to yours here!
+multiplier = list(Daniel=2, David=1, Hagen=1, Hannah=1, Jonathan=2, Kirstin=2, Lea=2, Leonard=2, Niels=2, Nikita=1, Noa=1, Paul=2, Serena=2, Stephan=2)[colnames(prefs)] %>% { ifelse(sapply(., is.null), 1, .) } %>% unlist %>% rep(seats) %>% matrix(byrow=T, ncol=peeps)
+
+weights = weights / normalizer * multiplier
+weights[is.na(weights)] = 0
+myrank = function(x, ties) rank(unique(-x))[match(-x,unique(-x))]
+ranks = weights %>% apply(2, myrank, ties='max')
+
+res = MIPModel() %>%
+  add_variable(x[seat, person], seat = 1:seats, person=1:peeps, type = "binary") %>%
+  set_objective(sum_expr(weights[seat, person] * x[seat, person], seat = 1:seats, person = 1:peeps), "max") %>%
+  add_constraint(sum_expr(x[seat, person], seat = 1:seats) == 1, person = 1:peeps) %>% # each person can only have one seat
+  add_constraint(sum_expr(x[seat, person], person = 1:peeps) <= 1, seat = 1:seats) %>% # each seat can only be given to one person (but seats can be free)
+  solve_model(with_ROI(solver = "glpk")) %>% 
+  get_solution(x[seat, person]) %>%
+  filter(value == 1) %>%
+  transmute(name=colnames(prefs)[person], seat=seat, weight=prefs[cbind(seat, person)], rank=ranks[cbind(seat, person)])
+res
+```
